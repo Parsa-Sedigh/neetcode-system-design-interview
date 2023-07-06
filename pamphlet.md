@@ -85,3 +85,47 @@ Sending data over network is even slower than reading from disk. Sending data in
 internet all around the world is even slower.
 
 ## 1 - Design a Rate Limiter
+Let's say we have 3 retries per hour for entering password on our phone. The reason for using rate limiter here is **security**. In this case,
+we're not using it for saving resources on our phone!
+
+Also on youtube we can only upload 20 videos per 24 hours. Why youtube does this?
+
+This is probably not for security reasons. It's because of cost and availability. Why cost? Because with videos, cost is an important factor.
+Why availability? Because someone can upload massive amount of videos and it will take up all of the storage and crash youtube.
+
+So the **context** in rate limiter is important. So depending on context, the rules for rate limiting change. Maybe 100 comments per day but
+20 videos per day.
+
+Also about comments on youtube: We can make a million comments. You may see a lot of bots writing comments, so this is a UX issue and also a security
+issue. We can use rate limiter here as well.
+
+An application like youtube could have rate limits in many places.
+
+Overall the main goal that we're trying to achieve is to prevent users or possibly even bots, from making too many reqs in some time period.
+
+Note: First step of interview would be to clarify the functional requirements with the interviewer. Because rate limiting can be really open-ended.
+
+**First question to ask:** Are we designing a rate limiter for some backend API? 
+
+This(backend API) is most commonly where rate limiters are implemented, especially in distributed systems.
+
+Let's assume the answer is yes.
+
+**Second question:** Is it just for a single API? Like maybe just a single microservice that we own and we're trying to protect just this single
+microservice.
+
+Most likely the answer would be no but the reason we even entertain this thought is because the easiest way we could do a rate limiter is
+inside of the application. In other words, in the microservice we can add more code to that and implement rate limiting in the code, like in a
+hash map. So keeping track of the rules in the code itself and keeping track of the reqs in some memory data structure like a hashmap.
+
+Since the answer is no, we're trying to design this rate limiter such that it will be able to protect multiple microservices or APIs and it should be reusable
+so that it can protect multiple services or APIs. Therefore we have to implement that rate limiter as a **separate service**. 
+
+## 2 - Design TinyUrl
+## 3 - Design Twitter
+## 4 - Design Discord
+## 5 - Design Youtube
+## 6 - Design Google Drive
+## 7 - Design Google Maps
+## 8 - Design a Key-Value Store
+# 9 - Design a Distributed Message Queue
