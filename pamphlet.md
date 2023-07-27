@@ -203,7 +203,7 @@ req that they've made in some time period, takes 128 bytes. So for each user, we
 one billion users, so we would have `132 bytes * 10^9 = 132 GB`. This is the amount of data that we need to possibly store for the rate limit counts
 for each user(not the rules).
 
-**Note: A billion is a giga.**
+**Note: A billion is a giga(so `1 billion bytes = 1 GB`).**
 
 It's feasible to fit 132 GB into memory. This is the takeaway from this portion.
 
@@ -367,6 +367,303 @@ we can scale that worker horizontally as well if we really needed to.
 ![](./img/1-2.png)
 
 ## 2 - Design TinyUrl
+Url shortening service like `bit.ly`.
+
+We're gonna be focusing on the core functionalities of a URL shortening service.
+
+### Background
+long url: https://neetcode.io/courses/system-design-for-beginners/1
+
+short url: https://tinyurl.com/9a3v32bp
+
+When we open up the short url, it's gonna redirect us automatically to the long url.
+
+### Functional requirements
+We want to be able to map long URLs to short URLs and then using those short URLs, we should be automatically redirected to the long url.
+
+Obviously the path in the short url should be relatively short(like `9a3v32bp`), that's the whole purpose. So while it would be
+even more user friendly that that path in the short url to actually be a meaningful word like `happy` or ..., we might not always be able to
+do that, we might need to have some jargon or some scrambled characters as path.
+
+- So let's say the restriction for us is that we want that random path to be 8 characters to keep it user-friendly.
+- to make it simple, let's say we don't include the case where users are able to specify their own string which could be user-friendly, so
+sth like (the word `happy`), because it's not too different for our design
+- in theory, a user could also delete a URL OFC only if they own it. So we need to keep track of the ownership of these URLs. But for simplicity,
+we won't consider the case where users can actually delete those URLS, even though it doesn't really change our design too much
+- our URLs do expire, maybe by default it's 1 year. So every URL expires after 1 year but maybe users can specify a longer time period that they want
+their URL to expire like 5 years, 10 years. So we do need to think about this in terms of a long-term mindset. We don't want to run out of resources.
+
+**Q:** A last clarifying question would be to ask: what would happen if multiple users had the exact same long url and they were trying to map it to a
+short url? Should it always map to the **same** short url? What difference would it make if a user is trying to shorten a URL
+but there's already a shorten version of that, why not just give them the same short URL?
+
+**A:** Well remember we do have the concept of ownership. What if I set my url to expire but somebody else had the same long URL shorten to
+the same shortened url? Then the shorten URL expires but the other user wanted that shorten version to expire in a future date. So even if the
+same long URL has already been shortened, we create a unique short URL every single time.
+
+The answer of this question is gonna affect the outcome of our design.
+
+### Non-functional requirements
+- obviously we want this to be as available as possible and as fault-tolerant as possible. So if components of our design end up failing,
+we do not want the entire system to shut down.
+- the point of a short url is to make it more user-friendly so we definitely don't want to add additional latency, because at that point you might
+stick with the long url, if the short url is gonna be so much slower. So we want minimal latency as possible.
+- the scale that we're gonna be dealing with: in the real world, with url shortner, what do you think we're gonna be doing more? writes or reads?
+In this case, a write will create a short URL and a read would be **using** a short URL(and getting what the long url it maps to, is?). So obviously
+reads are gonna be a lot more frequent, because you're probably not gonna create a short URL just to use it one time, that would mean
+a one to one ratio, but reads are probably gonna be a lot more frequent
+You can already guess this, but to clarify this with your interviewer maybe they say: we're gonna have a ratio of 1 to 100, so 100 reads for every write.
+- how many urls are we actually gonna create?
+This is generic enough service, we could be dealing with a lot of short URLs. Let's say the number that your interviewer gives you is sth like
+**1 billion short urls created per month**. This is a very large number. The first thing that's going through our mind is we only have
+8 characters, are we going to run out of space? To ensure that we don't, we should use as many digits or characters as possible for every single
+position. Let's say we can use digits 0-9 and a-z and A-Z , that gives us `62` characters to choose from and `62^8` is gonna be a very large 
+number(this would be hard to calculate on a back of an envelope or in your head). But remember 60^2 is 3600 and we know: 3600 = (60^2)^4 = 60^8 .
+We know 3600^2 is gonna be at least 9 million(because 1000^2 is a million and you have 3^2 as well here, so 3600^2 is gonna be a million).
+Now 1M^2(a million squared) is roughly a trillion. So `1T` is quite a lot of possibilities we have with short urls. If we're creating `1B`(one billion)
+per month, we're not gonna run out for `12B` per year. So we would have at least almost 100 years. So this is pretty dang good. We don't have to
+worry about that.
+
+One billion writes per month it's gonna be around 33 Million writes per day and for each second, it's gonna be: 33M/100000s and the result is gonna
+be roughly 330 writes per second and if we round this, it's gonna be 300 or you can round up to **400 writes per second**.
+
+**Note:** We consider a day roughly as 100000 seconds.
+
+`400 writes per second` is not a ton, but still a pretty large amount. Now if we have a ratio of 1:100 w/r and the number of writes per second was
+300, we're gonna have `300 * 10^2 reads per second`. So we definitely have a lot more reads and this number for reads is actually quite a lot of
+reads.
+
+So we're gonna need to be able to handle this scale and try to identify the bottlenecks.
+
+- **storage**: When we talk about storage, the writes are clearly more important. If we have `1B` writes per month, how many urls are we storing
+per month? 
+A: We know that `https://tinyurl.com` is kinda a base domain, it could be anything, but we probably don't need to store the base domain for every
+single URL, because clearly it's gonna be the same. We just store those 8 characters and that's gonna be 8 bytes. So does that mean we have
+8 billion bytes? Or in other words 8 GB? No, we might need to store more than just those 8 characters. We might need to store some more metadata.
+Of course, we're gonna store the long URL that the short version corresponds to. So how many characters could that long url be? Probably on average,
+100 characters for storing it would be fine, but it could be a lot larger. Could be 1000 characters if there's some super long URL.
+But let's keep the average case in mind(100 chars, so 100 bytes).
+
+So we have the total of about `108` bytes per user. But maybe we want to store additional metadata, maybe userId and ..., let's say 1000 bytes per URL.
+As we'll see though, most likely it would actually be significantly less than this on average.
+
+**Note:** 1 character = 1 Byte
+
+**Total storage:** If we have 1000 bytes per URL and we have `1B` URLs created per month, we're gonna have `1000 * 1B` that's gonna be a trillion,
+so 1TB which is a terra byte. So a terra byte per month. This is reasonable, it's a lot smaller than the scale of a social media network.
+So we're not storing that much data when you think about it. A terrabyte per month over the course of 10 years, will end up being a pedabyte,
+not that bad.
+
+**Note:** A trillion bytes is a terra byte.
+
+### High level design
+Q: What type of storage solution would we want to use?
+
+A: We talked about how we have a large amount of data, but it's not super large. The big thing for us is actually the amount of reads that we're
+gonna be doing to that storage solution. We're not gonna be writing frequently. So how are we gonna be able to handle this scale?
+
+We can use some type of NoSQL DB, since they're specifically designed to be able to handle a large amount of scale. Now they don't come with the
+**ACID** properties and they're definitely not relational but we're not gonna be storing a lot. At the very core, we're just gonna be mapping a 
+long url to a short url and storing them together with maybe additional metadata sth like the userId and ... , but it's not like we're gonna
+be doing a bunch of joins and complex queries. We don't need those ACID rules, we don't need atomic transactions and actually with **BASE** properties
+with NoSQL, we have **eventual consistency**, so when we create a URL, it might be that somebody reads one of our DB replicas and maybe that DB
+replica does not have the most up-to-date URL just yet. That's fine. Because we know eventually all of our replicas will be consistent, it's not like
+we're gonna be writing super frequently, eventually the replica will have that up-to-date url and it might take a few seconds and that's perfectly
+fine, but after all the replicas have the URL, it will be working, it will be able to handle that scale.
+
+---
+
+The main responsibility of this NoSQL DB is gonna be to store those URLs.
+
+#### Main user scenarios
+##### Creating
+The main use scenarios we're gonna be doing is a user is going to possibly create a URL. They're gonna hit some server and suppose we have
+some type of way of generating a URL. So let's say we have another server besides that mentioned server and that server is named `url-generator`
+and then from the server(not the url-generator service), write to the DB and that DB may not be a single node DB, OFC there could be replicas and
+it could be distributed and all that and that would be the scenario where a user is writing or creating a small URL given a long URL
+
+![](./img/2-1.png)
+
+##### Reading
+User hits the server and given some short url, we want to find in the DB what is the corresponding long URL and return that to the user and then the
+user will be redirected to that long url.
+
+Since we know we're gonna be doing things very read-heavy, OFC we want the generated tiny URLs to be persisted, but it's probably good
+for us to have some sort of caching layer in between. So server first hit the cache and see if the tiny URL is there, because
+most likely, there's gonna be a few tiny URLs that are used a lot more frequently than others. So having that subset of URLs in the cache,
+will create a much better performance and it will speed the redirect up a lot.
+
+**Note:** This cache should OFC be an in-memory cache because that's kinda the whole point of making it faster than reading from disk on our DB.
+
+### Design details
+We haven't talked about what the req would like look to the server and we especially have not talked about how the URLs will be generated?
+Also we'll talk about how to scale this, but there are a few other points that are more important for this problem than the scale.
+
+---
+
+Q: For the caching that we have, what type of algorithm could we have? and what size would cache actually be?
+
+A: We talked about how `1TB` of URLs will be created per month. Now OFC the reads will be 1000 * 1TB, but that doesn't mean that we're gonna have
+that many **unique URLs**, that doesn't mean we need `1PB` of data for the amount of URLs that are gonna be read per month or in some type of time period.
+**So a reasonable size for our cache would be sth like `256GB`**. This number is reasonable for memory, though it might be pretty expensive, but for a 
+system like this, it's not the end of the world. Our cache could be distributed, we could implement sharding(for cache) and
+OFC having it(cache) replicated as well.
+
+Q: What type of algorithm would we use for our cache? What type of eviction policy would we use?
+
+A: We could try `LFU`(least frequently used) or `LRU`(least recent used). `LRU` would be a bit better because we could have some tiny URLs
+that are used really frequently like a million times, but then after a while nobody is using them anymore, maybe there was some type of trend
+or ... , but that URL has not been used for a long time but has a large count, then it would end up staying in the cache and it's kinda useless,
+it's just taking up space. So we prefer LRU, because we only want the active URLs to be in the cache, so we can avoid the cache misses.
+
+**So the scenario would be:**
+
+A user is trying to find the long URL given some short URL(**user wants the long url by giving us the short URL, because he wants to be redirected to
+the original url which is the long one**). The server will first read from the cache, if we have a cache hit, we will have the long url and we return
+it to the user. If we don't, we have to go read from the disk(database) and that will end up taking longer.
+
+#### How the URL redirection would actually work?
+What would happen if the user types `tinyurl.com/9a3v32bp`, yeah they will be redirected but how does that work?
+
+The response that we'll get from sending a req to the short url, will have a status code of 301, meaning a resource has been moved - the resource
+does exist but it's not gonna be found at the original url(which in this case is the short url) and in the response headers, there's a header
+called `location` which will contain the location of the resource(long url). With that header, the browser will redirect us to the value in the
+`location` header automatically.
+
+What type of status code could we get?
+
+We could get 301 or 302. The main difference is 301 tells you that this resource has been permanently moved to the URL specified in the `location` header of
+response. So what your browser will do is it will cache this information. It will say: Ok the short URL will always map to the long url, so next time
+you type the short url, the browser not even gonna ask the short url related server(specified in the url we asked) to return us the long url,
+the browser knows automatically the long url related to this short url you typed. So after the first req, all subsequent reqs will be as if you're
+typing in the long url, because it'll happen immediately by reading from cache. This was for 301.
+
+With 302, it implies that this(short url that you typed) has **temporarily** been moved to the value in the location header of response. So it(browser)
+won't cache it and every single time you type the short url, it will ask the url shortner server what's the long url? Maybe by requesting
+the long url next day(with the same short url), the long url would be different(that's why the server responds with 302 - because it's temporarily).
+
+In this case, it makes sense to use 301 in the response status code. But the reason 302 might be better is if for some reason, tinyurl wanted every req
+to go through them(tinyurl servers) maybe for analytics purposes or sth like that.
+
+#### How are we gonna generate these URLs? How are we gonna generate an 8 character string?
+For each character we have 62 possibilities. How can we make sure we do it in a way that we don't have collisions? Because **one of the problems with
+hashing is we could have two different stings that map to the same 8 character string that is used to create the tinyurl short url(collision situation)**.
+
+So a problem with hashing is having 2 different input but the generated hash could be the same.
+
+**With hashing we can also guarantee that the hashed string is going to be exactly 8 characters long.**
+
+One thing we can do is we can generate all possible strings of length 8, or at least most of them and store them in a DB. So maybe our url generator
+will have a DB and it will have all the keys(the extension path of tinyurl - the path in the short url). This is surprisingly simple but it 
+actually works, we will not have collisions if what we do is the user makes a req to create a tinyurl. We need to find some key that has not been
+used yet, so that we can say: that key maps to the url that the user specified. So our server will just fetch one from the URL generator service
+(at the high level).
+
+Note: Our URL generator service can just be a DB, if we pre-populate it, or we could have a service running that is populating the DB which holds
+the keys(paths of tinyurl) at some point as we start to run out of keys, because we don't necessarily need to generate all `62^8` immediately.
+To make this even faster, since we might have to be reading from disk(DB) and OFC we're not gonna need to read all the keys at the same time, we just need
+a subset of them and it doesn't really matter which subset we take as long as they have not been used yet, so our URL generator service can have a
+cache inside of it where it can just load some keys into memory(subset of keys in DB), it can: 
+1. **periodically** do it
+2. or as it starts to run low on the remaining keys in cache, it can make a single bulk req to get a bunch of keys from DB and load it into memory(cache)
+and then it will be able to use those keys.
+
+With this cache, it will be able to use those keys a lot faster. Everytime we generate a short url, we won't have to read from disk(DB) and this will
+make things faster.
+
+When we do take that subset of keys from db and load it in memory, remember that this url generator service may not be a single instance server,
+this entire service could have multiple url generator services and remember **the whole thing we're trying to avoid, is we do not want to
+reuse a key**, so when we take that subset of keys, we want to mark them as used in our DB. For example our DB has a column named **key** and another one
+called **used**
+
+| key | used |
+|-----|------|
+|     |      |
+|     |      |
+
+and everytime we fetch keys from db into cache, we wanna make sure that they are unused keys. If a key has been used though, we don't necessarily
+need to delete it, we can still keep it in the DB as long as we mark it as used. The reason we do that is after a URL expires, we can then start
+reusing it, we can mark it as unused and this helps us from running out of keys.
+
+**About the problem on concurrency:** What would happen if multiple URL generator instances were reading the same key? What if two users are
+making a req to create a tinyurl and at the same time, they both end up with the exact same key(they both get the same key that we generated and have
+put in DB), that would obviously be a problem. Because one tinyurl can not map to two long urls. So one of these users would not get what he
+asked for, things would break, the functionality would not work for that user on that given request.
+
+How can we prevent this?
+
+What type of DB would help us prevent this? SQL DB or NoSQL?
+
+It's not like we have a lot of data here, it's not like we have a relational data, so we might not need SQL, but don't forget
+that SQL comes with ACID properties and in this case, which one of these properties would help us in terms of the concurrency issue?
+
+A: Atomic and isolation properties are gonna help. Because the transaction that we're gonna be doing with our DB is reading a key that has not been used
+and in the same transaction, we're gonna be marking that key as used. So this transaction is atomic(it's all or nothing), it's gonna execute
+everything or it's not gonna execute anything and remember two(or more) of these transactions could happen concurrently, but they're gonna appear
+as if they were happening one by one, that's what **isolation** means. So one of them is gonna completely finish(we're gonna query an unused
+key and then mark it as used) and then maybe the next transaction is gonna execute and they're gonna get an unused key and since the previous
+transaction has completed, it can not possibly be the one that the first user got, because they already marked it as used.
+
+Consistency for ACID means we follow the constraints like primary keys, foreign keys and ... .
+
+So use SQL DB for keys DB.
+
+### Fault tolerance
+What about the fault tolerance of a URL generator service? What if we have multiple instances, one of them loads a bunch of keys into the memory,
+it crashes? It marked those keys as used, but they never end up getting used(all the keys in the cache will be marked as used in the DB).
+
+In this case, we kinda see a tradeoff between loading the keys in the cache because of speed, but if we interact with the DB which is slower,
+but we do get the ACID properties. Remember we have 300 writes/second, we should be able to handle this with the DB.
+
+An even better thing to do would be to use the in-memory cache but to prevent concurrency issues, we implement some type of locking to make sure
+that a single key can not possibly be used by multiple users, it can't even be read by multiple users. So on a request, as soon as we identify
+the key(path segment of tinyurl) for that req, we will lock that row in in-memory store.
+
+![](./img/2-2.png)
+
+### How would we be able to handle deletes? How handle a URL expiring?
+First of all how would we even detect if a url expired?
+
+One way to do it would be to have a cleanup service. It may not happen immediately. So if a url is set to expire at a particular time,
+it's not the end of the world if it takes maybe 5 extra minutes for it to be deleted(you can discuss the duration here). 
+
+So a cleanup service which periodically(maybe every 5m or an hour) reads from the URL DB and filters them by the expiration date and reads all the rows
+that have been expired, what it will do is it first take the key and goes to the keys DB(the SQL DB) and frees it, so it will 
+mark that key as **unused**, so that it can possibly be used again. It will also delete that URL from the URL DB, since we don't need to
+store the long URL anymore that the key was originally mapped to.
+
+So the cleanup service does it's work asynchronously, it doesn't need to happen on every req that is made to the server by the user.
+
+### How would we handle the scale with this design?
+Our design is implemented such that it can actually handle the scale that we need to.
+
+The easiest thing to do would just be to introduce a load balancer in between the client and the server. Because we could have multiple instances
+of the server and we could load balance them and OFC we will have multiple replicas of the URL DB and actually not just replicas, we might need to
+partition the data of URL DB, so we could obviously have a load balancer between the servers and the URL DBs.
+
+How would we partition the URL DB?
+
+The easiest way would be to hash the user id and using consistent hashing, if we have multiple partitions of the URL DB, we can guarantee that the same
+user will be hitting the same partition and all the URLs for that particular user id will be stored on a single partition and this should be able to
+handle scaling up and scaling down.
+
+We could also introduce a load balancer layer in between servers and the cache.
+
+The thing you definitely should not miss for this problem is that you would need a NoSQL for the URL mapping storage(URL DB).
+
+**Q:** What data would we have in that NoSQL DB(URL DB - in the middle of the pic)?
+
+**A:**
+- The user id: assuming that the user needs to signup or we have some type of key to identify a user before they actually start creating URLs.
+- long url: 
+- path segment of tinyurl(key): The key is enough for the server to generate the entire url, because it can just use the base url(tinyurl.com/<key>)
+- expiration date: Which is needed by the cleanup service
+- other fields like creation time of that url and ...
+
+This was one way of designing tinyurl.
+
+**So the URL DB(s) is gonna be NoSQL and the keys DB is gonna be SQL.**
+
 ## 3 - Design Twitter
 ## 4 - Design Discord
 ## 5 - Design Youtube
