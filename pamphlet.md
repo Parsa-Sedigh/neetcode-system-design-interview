@@ -671,3 +671,227 @@ This was one way of designing tinyurl.
 ## 7 - Design Google Maps
 ## 8 - Design a Key-Value Store
 ## 9 - Design a Distributed Message Queue
+How they can be implemented? How can we scale them?
+
+### Background
+There are many kinds of message queues and they had a lot of evolution over the years which kinda blurred the differences between them.
+
+#### one-to-one pattern
+
+Talking about more of a traditional message queue, sth like rabbitmq which started out as sort of a one to one mapping. So you produced messages on
+one side and then consume them on the other side. So it was just one system creating messages and adding them to the queue and then one consumer
+taking those messages. So kinda how a queue DS works in code(currently rabbitmq supports more than just this, this is just history).
+
+So this was the one-to-one pattern.
+
+#### pub-sub pattern
+Things get more powerful when talking about the pub/sub pattern which is also a pattern that can be applied to code, but in terms of distributed
+systems, they're also helpful and have additional complexity with them.
+
+At a high level, we have publishers and subscribers. But these two are actually part of **our** application. So we could have some servers
+as publishers and possibly they are payment transaction servers, like everytime we receive a payment, we have our application servers that do sth
+with that payment info. Maybe these servers can't process the payments immediately. So we want to process them asynchronously, because if we can't
+handle the traffic of like the payments, but we keep receiving payments, then eventually our servers might miss some of the payments or the servers might
+crash and not be able to process them. If it takes a few extra seconds to process them asynchronously, that won't be the end of the world.
+
+So what we do instead is everytime the servers receive a payment, we send those payments to our pub/sub message queue system. Now there are topics 
+are sort of entities within the pub/sub system. So first of all, the messages that we get, will be persisted in the message queue, in 
+some type of persistence storage they'll be stored so we definitely will not lose them and then eventually, messages will end up going to
+subscribers and those subscribers may be the ones that actually process the payments.
+
+Note: The subscribers will get those messages **as needed** meaning if they can't process those messages immediately, it's OK, because 
+the messages can still be stored within the pub/sub system.
+
+Note: It's up to subscriber to which topic(s) it consumes. One of them could receive messages from multiple topics, one of them only receives
+messages from one topic. This also adds some decoupling to our system, where the publishers don't need to know about the subscribers. Only the
+pub/sub system needs to know about publishers **and** subscribers. This also allows for additional **scaling**.
+
+subscriber is pretty much the same as consumer.
+
+- In kafka: producers -> consumers 
+- publishers -> subscribers
+
+Note: Kafka technically is not a message queue, it's more for event streaming, but the lines are sorta blurred between the message queue and
+event streaming systems, they support a lot of the same functionality, for example kafka does support fanout, persistent storage(messages can be
+retained in kafka for a certain period of time).
+
+### Functional requirements
+1. we want to support **fanout**. Meaning with our message queue, we want the same message to be received by multiple subscribers a.k.a consumers.
+2. being able to **retain** messages. But in our case, we're gonna simplify and only retain the messages until they're delivered.
+3. we want to support **at least once delivery**. Why this is important? Because we want every single message that's received by our pub/sub system
+to definitely deliver that message at least once. Because if we can't guarantee that, which means some of the messages, are never going
+to leave aka, some of the messages are gonna be lost and we definitely don't want that to happen because that's one of the points behind using a
+message queue. There are other types of delivery with message queues, things like **at most once delivery**. Why that would be important?
+Because if we don't want the same message to be sent multiple times, because you don't want to end up with duplicate messages. With payments that
+could be important, - because you don't want the same payment to be processed multiple times. So you want a guarantee at most once delivery, but
+if we have at most once delivery but not at least once delivery, that brings us to the problem where a message might get dropped. So
+there's also a third type called **exactly once delivery** which means every message will be received and get sent out exactly once, so we can
+guarantee that every message will be delivered exactly once, so we won't end up with duplicate messages and we won't end up with messages that
+get dropped, but we're not going to support this in our design just for simplicity. This one is actually a pretty complicated problem to solved and
+there are a lot of tradeoffs that can be made when trying to design this.
+
+**Note:** The at least once delivery is the most important type.
+
+![](./img/9-1.png)
+
+### Non-functional requirements
+1. needs to be **scalable**. Ideally we should be able to horizontally scale our message queue. If we add more and more publishers and more and more
+subscribers, we should be able to scale out our system to be able to handle the traffic.
+2. we want **persistent storage**, we do not want the messages to be lost(this was already in the functional requirements, but it's worth mentioning here
+as well)
+3. we want high throughput
+
+### High-level design
+Remember that publishers are servers that our application owns, but they're not necessarily a part of the message queue that we're designing, but OFC
+they're a very important part because the message queue doesn't really do anything if we don't have publishers and subscribers.
+
+First of all remember publishers are going to be sending messages into the message queue and then subscribers are going to be receiving messages
+from the message queue and somewhere in between, the messages are going to be stored to make sure that we never lose them.
+
+So at a high level, we know we're going to have some servers as **publish forwarders** that are part of the
+message queue(blue ones at the top of the message queue) and another layer of servers as **subscriber forwarders**(purple ones).
+
+The idea is: As publishers create messages, they will send the messages into our pub/sub system(in other words, the message queue) and they'll be
+received by the publish forwarders. Depending on number of messages that we're sending(producing), we may need to scale the publish forwarders.
+But remember the **same** message produced by a publisher, might get sent to **multiple** subscriber publishers. So it's important to
+be able to independently scale the subscriber forwarders which will be sending the messages to the subscribers. Maybe the same messages needs to
+get sent to a bunch(multiple) subscribers. So we'd need to scale subscriber forwarders **more** than we scale the publish forwarders. Or OFC we could have
+the opposite case where we have a bunch of publishers but all the messages are getting sent to a **single** subscriber forwarder and we only have
+one subscriber. Then we need to scale publish subscribers more than forward subscriber.
+
+As those messages come into the publish forwarders, those messages will then be stored somewhere, possibly a DB, which stores all of the messages
+and as soon as a message is stored(persisted), we know the message should never get lost at this point. So typically what's done is 
+the pub/sub system(actually a publisher forwarder which is part of the pub/sub system) will then send a message back to that publisher, telling it that
+the message you just sent me with the related id, has been stored. So basically one of the publish forwarders(the same one that received the message
+in the first place) would send an acknowledgment(ack) to the publisher saying: Your message has been stored, you don't have to worry about it anymore, you
+don't have to try to send it to me again, because if the message was never received, we know the publisher doesn't want the message to get lost, so it
+will probably try to send it again. This is all part of the **fault tolerance** that the message queue should provide.
+
+After the publishers receives the ack, then it can send different messages(if it has any).
+
+Generally, sending messages by publishers is done over **HTTP**.
+
+We don't get into the security, but probably we wouldn't want anybody to just be able to send a message into the message queue for obvious reasons like
+being able to take our servers down, store too much data and ... .
+
+Once those messages are stored, subscriber forwarders can read that data(messages in the DB) and then send it to their relevant subscribers and then
+once a subscriber has seen a message, then they will send an acknowledgment back to the pub/sub system and once a particular message has been read
+by all of the subscribers, then we probably don't need to store that message anymore. If a message has been acked by every relevant subscriber,
+then we can probably remove that message from storage. This will ensure that we support **at least once delivery**. Because if we guarantee that
+everyone(subscriber) has already seen the message, then we know we're safe to delete it and we won't end up taking an infinite amount of storage.
+
+#### Secondary data storage
+We might need a secondary data storage system and this could be for metadata. Specifically we might want to store information on how many
+subscribers we have.
+
+Note: What are topics in message queue?
+
+**Topic:**
+
+A topic is a way to organize messages. So when we receives messages into our pub/sub system, we may have a single topic for payments for example.
+All payment info(messages) will get sent to this topic. If we ended up having a very large amount of messages stored in the messages DB, we probably
+want to shard it based on the topic, if possible. But even a **single** topic may have too many messages in the messages DB.
+
+**Subscription:**
+
+When messages are created and sent by publishers, they will go to a topic(they could go to multiple topics, if the publisher decides that, but anyways,
+they will be organized based on a topic). Now when messages are consumed and received by subscribers, they will go through a subscription.
+One of the major things about a subscription is it's used to fanout information from a topic(to fanout the messages).
+
+For example if we wanted two specific subscribers to receive messages from the payments topic, we could create two subscriptions for the same topic.
+So we have two subscriptions for that topic and each of those subscribers(servers) listens to a single subscription. So this was a way to
+fanout the messages and also this is a way to guarantee that each message is received by both of the subscriptions and both of the subscribers.
+Maybe one of the subscribers is for processing the payment and one of them is for fraud detection. We definitely don't want the messages to
+only be received by one of them, we want **both** of them to receive and this is a way to do that.
+
+These topics and subscriptions are sort of abstracted.
+
+We'll store which topics and subscriptions exist in the metadata DB and this will allow us do this:
+
+When a message has been acknowledged by the subscriber that it received the message, we can go to the metadata DB and see that a certain topic
+has for example two subscriptions and we can record: Ok, one of the subscriptions has already seen the message(since it acknowledged it), but another
+subscription has not seen the message, it hasn't sent the acknowledgment yet, so at this point we would know we can't delete that message yet from the
+messages DB, but maybe as soon as the other subscriber sends the acknowledgment, then we see that both of the subscriptions on that topic have
+seen that particular message, so then we could remove that message from the messages DB. It doesn't need to be stored anymore because all of the
+relevant subscribers(subscriptions of that topic) have already seen it.
+
+Ideally we'd also want the messages to be FIFO. So ideally we'd like to have ordering with the messages. So in the same order that the messages
+are received from publishers and then stored into the messages DB, is the same order that we'd like to deliver the messages.
+So at a high level, the publishers can create some type of id which is tied to the timestamp that those messages were received and those messages can be
+stored in the messages DB using that id.
+
+Since we don't need to do complex joins, we can probably just stick with a NoSQL DB for storing the messages, because a message is typically
+like a JSON object. Probably a relational DB would work just as well here. A reason to go with a SQL DB in this case would be for the
+ACID properties. In this case, if we possibly store the messages and just auto increment the id, then we can kinda be sure that the messages will
+be stored in the order that they were received and in that case, the **isolation** property of ACID would be important, because we will be having
+multiple publish forwarders concurrently writing to the messages DB and we want to write those messages in an isolated way.
+
+There are other policies we can have for retention:
+- we could design our system such that we can store messages even if every subscriber has received those messages. We could set like a 7day policy
+even after every subscriber has acknowledged them.
+- or we could set a 7day policy where even if some subscribers have **not** acknowledged them, we will still those messages anyway
+
+So we can have flexibility in message queues including pub/sub and real message queue systems generally support this functionally.
+
+**Q:** What about replication of our messages DB? When we take a message and we just store it one time in a single DB and then we send the acknowledgment to the publisher saying: hey, we guarantee
+we're going to deliver this message or at least it will never be lost. How can we make that guarantee if we're just storing it in a single DB?
+What if the DB crashes? What if the data center explodes? All of the data is definitely going to be lost.
+
+**A:** So probably we should replicate the messages DB among additional database instances. But how many times should we replicate it?
+Probably at least 3 is a good rule of thumb. Especially if these 3 are located in different regions of the world.
+
+Q: When should we send the acknowledgment to the publisher? If we take that message and we store it in just a single DB replica and 
+we know it eventually is gonna replicate it, but it might not! What if the other replicas crashed or sth happens, at what point can we
+say we safely tell the publisher we acknowledged that we received the message and it's been stored? Should we just store it in a single replica?
+
+A: Well we should definitely store it in at least one replica, but should we wait until it's been stored in 2 replicas? Or should we wait
+until it's been stored in all of the replicas? Because this is a tradeoff between latency and fault tolerance. If we only store it in a single
+replica before sending the acknowledgment, then we're lowering the latency but that's also not as good for fault tolerance, because we have not
+stored it, we have not replicated that yet, so at some point the DB that has the last message could crash or explodes and we didn't replicate
+it but we still sent the acknowledgment, so that's not good. Maybe we can wait, we can increase the latency, we can wait a little bit, until
+that message has been stored at least in 2 replicas(2 times). This is good for fault tolerance. Because we know we replicated it in two different
+DB replicas. We could wait even longer on average until it's been replicated 3 times. So this is a tradeoff worth discussing.
+
+Depending on the throughput of our system and what we're trying to optimize for, we might be willing to be flexible on the number of replicas to store
+the message before sending an ack to the publisher.
+
+#### Pull vs push based delivery
+When subscribers receive messages, we can do it in two different ways:
+- pull based: The subscriber will be pulling messages from our pub/sub system. So the subscriber will be the one initiating the request, it will say:
+I'm ready to proces more messages, let me make a request, let's see if there's any messages ready. One obvious downside is that what if
+there aren't any messages ready, then this subscriber just made a request for no reasons and it doesn't even know when the next message
+will be ready, it could not be ready for hours. What's gonna happen in the meantime? Well, depending on the arcadance that this subscriber makes reqs on,
+the frequency could be every 5s, that's gonna be a lot of wasted reqs, or we could make it a lot slower we could make it 30s and then the subscriber
+will send a new req. The downside of this case is that it may increase **latency**, there might be a new message ready, but we won't see it for another
+29s because we have to wait. So obviously this would be slower but the benefit would be that the subscriber can process data when it sends the req
+for pulling messages. So the latter case might be suitable for **batch-based processing**.
+- push based delivery: The message will be sent from the subscriber forwarder to the subscriber as soon as the message is ready. The downside here is
+what if the subscriber is not ready? Well that's fine, when the subscriber forwarder will send the message, it will never receive an acknowledgment
+from the subscriber, therefore maybe 10s later it will try to resend the messages. The downside here is that if it just keeps resending the message
+and this subscriber is not ready, that's also a lot of wasted time and if too much data is sent, it could end up overwhelming(overloading)
+the subscribers, though they'll probably never crash, it's just that they'll just keep getting sent messages and they can't really do anything with
+them until they're done processing the current messages. The good thing about this is it can minimize the **latency**. So if we're going for 
+**stream-based processing** where we want the messages to be sent to the subscribers as soon as they're ready, this is the best thing.
+
+Generally, you don't need to decide on which delivery type(push vs pull). Because most message queue systems will support both pull and push based
+message delivery.
+
+This was a high-level design of a message queue pub/sub based system.
+
+If we have persistent data, you definitely end up needing a DB type system. Kafka which is an event processing message queue, ends up storing
+messages in sth called a write a head log(WAL). The correct term for kafka is message broker. But the line is kinda being blurred between kafka
+and traditional message queues.
+
+Note: In between publishers and pub/sub system, generally there will be a load balancer because those publishers could be located all around the world
+and we might want to load balance them and send their req(sending messages) to the nearest publish forwarder and similarly with the
+subscriber forwarders and the subscribers as well(we would have a load balancer there as well).
+
+Note: For us to store info about what subscribers we have(metadata store), which subscriptions we've created, how many subscribers we have, which topics 
+we have like the relationships between them, we might want to use a highly available key-value store, sth like zookeeper or etcd and even more
+importantly, with this metadata DB, we probably want another service sth like a control plane or a coordinate service to manage
+that, like manage the state of the subscriber(subscribing) forwarders, the coordination between assigning subscribers and subscriber forwarders
+and manage the health of our messages DB(Msgs DB), maybe this service can determine how to shard the data in messages DB and partition them as we need to
+and possibly this would also manage any req we receive to update the state of our message queue for example if we want to change it from
+pull based to push based and ... .
+
+![](./img/9-2.png)
