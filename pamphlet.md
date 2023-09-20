@@ -665,6 +665,280 @@ This was one way of designing tinyurl.
 **So the URL DB(s) is gonna be NoSQL and the keys DB is gonna be SQL.**
 
 ## 3 - Design Twitter
+### Background
+It's a Social network. Some people can follow other people and that relationship can be mutual(that person follows the other person back).
+Most people on twitter probably aren't tweeting very often. Most people don't have many followers. Therefore, it means that
+this is gonna be a very read-heavy system.
+
+Also discuss the functionalities that you can have for example having img and video on a tweet, follow, unfollow a user on a tweet, like,
+retweet, edit a tweet and ... .
+
+### Functional requirements
+What do we want to spend most of our time on? and what parts can we just kind of hand wave and briefly discuss?
+
+1. follow others
+2. create tweets
+3. view news feed
+
+At a basic level, the first and second features are straightforward. But the third one is complicated.
+
+About #2:
+
+What exactly is gonna go into a tweet?
+
+Tweet has a limit on tweet size -> 140 chars . We also have to include images and vids in the tweets.
+
+About #3:
+
+Viewing a feed can be more complicated especially when we get into how we wanna rank that feed? What kind of algo are we gonna use?
+Probably there's ML going on in there and in many cases, you end up seeing tweets in your feed by people that you're not even following, 
+but we're gonna assume that that's not the case. For viewing a feed, we just wanna see tweets of people that we actually follow. This is
+sth worth clarifying with the interviewer.
+
+### Non-Functional requirements
+How many users?
+
+500M total users. Daily active users: 200M . Almost half of the users are active. So when we create feeds for users, we'll be doing it for
+half of the users. Now while most people we'll be viewing their feed, they probably won't be creating tweets. Clarify this.
+
+Let's say of those 200M daily active users, each of them will read about 100 tweets per day -> 200 M * 100 = 20B tweet reads per day.
+Now what is the size of each tweet? If we have 140 chars, that's about 140Bytes, but let's assume there's additional information with the tweet,
+we have the username of tweet, possibly there's a lot more metadata, to be safe, for a basic tweet that just includes text, we can assume
+for each tweet, we have to do **1KB** of reading from our storage. Some tweets can contain images and videos, so on average, the number is gonna be
+higher, how much? You can ask this, like what is the limit size of image and video. So like 10MB or higher.
+
+But since few tweets are gonna have media, so we averaged down the tweet size to **1MB**. Because most tweets are gonna be about a KB.
+
+**Every tweet = 1MB**
+
+**1 character = 1 byte**
+
+So how much data are we gonna be reading?
+
+20B * 1MB = ? . How find the result? If each tweet was just 1 Byte, the result is gonna be 20GB. Now 20GB * 1MB = ? . We know 20GB * 1000 = 20TB .
+Now we have to multiply 20TB by another 1000 to get to the `* 1MB` result. The final result is `20PB`.
+
+So overall **we're gonna be reading 20PB of data per day**. So this is gonna be a read-heavy system. This is kinda hinting to us what type of
+storage solution should we use. We probably don't need to be strongly consistent, eventual consistency is enough. That brings us
+to how much are we gonna b e writing per day? How many tweets are we gonna be creating per day?
+
+Well, we have 200M daily active users. So let's say a reasonable number is **50M tweets created per day**. Because most people aren't gonna be creating
+tweets, but maybe some people create 10 tweets per day. You shouldn't guess this number, your interviewer should give you this number.
+
+Now it's not good to say the total amount of write is gonna be: 50M * 1MB . Because we don't directly store the images and videos of tweets in DB.
+
+So we're gonna be writing much less than we read. This is how we're gonna be optimize our design(read heavy).
+
+Let's say average user follows about 100 people. So 100 follows per person.
+
+An important consideration is a user can have 100M followers. So for all the people that follow celebrities, how are they gonna get the tweets?
+This is kinda hinting to us that wherever we're storing the celebrities tweets with massive followers, it's gonna get **overloaded** pretty quickly.
+
+### High level design
+Everything start with the client(that dummy in img). Whether it's a PC or mobile device, it doesn't matter for us. We're focusing on backend which is
+agnostic to the frontend.
+
+The first thing our client is gonna be hitting is the app servers to perform actions like creating a tweet or getting their news feed or following
+someone. Now because of the scale that we're dealing with, we're probably gonna be bottle necked by getting the news feed. That's what's gonna be
+happening most frequently and if we want to scale this up, assuming that these application servers are stateless, it should be easy to scale
+them up and OFC we will have the load balancers in between of client and app servers.
+
+**Note:** When you wanna scale horizontally, you need load balancers.
+
+Our app servers are gonna be reading from some storage. Let's say it is a relational DB. You might be thinking: `If we're gonna be
+doing read heavy, why use a relational DB, why not just have a noSQL DB?`.
+
+Well it depends on what type of data we're gonna be storing. Do we need joins in this case? and we **could**. So we do have a very relational
+model when it comes to following. That's a pretty clear relationship between followers and followees. So that's a reason to go with a relational
+DB. Now in theory it would be easier to scale a noSQL DB, but we can implement sharding with a relational DB, so that does give us some
+flexibility. Though after finishing our high level design, we might wanna revise this storage, because we could just store tweets and user information
+in a noSQL DB and then have the **GraphDB** which would be very easy to find that follower relationship because a graphDB is essentially like
+an adjacency list graph where every person is a node in the graph and to find all the people that they follow, we have to look at every outgoing
+edge of a node and to find all the followers of a person, we just have to look at every incoming edge.
+
+**With the massive amount of reads that we're gonna be doing, we have to have a caching layer in between.**
+
+As we're reading tweets, we will be hitting our cache before we hit our DB.
+
+Also remember we're gonna be storing media. So **we need a separate storage solution for that media**. Relational DBs aren't the best for that.
+So we'll have some type of object storage for that, sth like google cloud storage or amazon s3.
+
+So when we read a tweet we'll be getting the info about that tweet like the tweet id, whose the creator of that tweet, what time was it created,
+whether it included an image or not, what was the image that it included, the profile picture of the person who made it, from cache or relational DB.
+The app server can then fetch the image like the profile picture or the video or img that showed up in that tweet. So it can get these info 
+separately(one for getting tweet info and one for fetching media).
+
+But at the same time, because theses assets(media) are static in nature, it maybe better to distribute the media over a CDN network. So then
+our app servers don't have to interact with the object storage. The app servers will respond to the client with all the info that they need 
+including the URL of that image or video that they need and then the client will make a separate req to CDN network which is tied to our
+object storage. What type of algo would we use in this case? Even though we're looking at the high level right now, we probably want to use
+a **pull based CDN**. We don't want to necessarily push every img or video from object storage to the CDN immediately. Also remember
+the benefit of the CDN is that it's geographically located closer to the user. **We know that people in india might be looking at different
+types of tweets and images and videos than people in US. So it doesn't make sense to push every single new tweet's media in the CDN network.**
+And with a pull-based CDN, we kinda guarantee that stuff that's loaded onto our CDN is the relevant stuff that people want to see anyway(the popular
+things).
+
+![](./img/3-1.png)
+
+### Design details
+Let's start with the APIs.
+
+We will have a **createTweet** api. There could be a lot of metadata sent with that req, OFC the userId of the person creating the tweet.
+The text of tweet, media, timestamp(assume the timestamp will be handled server side instead of being sent by client).
+
+In header of the HTTP req there's some authorization token for us to know that the correct person is making the tweet.
+
+Next **getFeed** API. This doesn't need any info from client. We just need to sent the userId so that we know which person's feed are we getting,
+but at the same time, another person should not be able to pass in my userId even if he knows it, to get my user feed. There's nothing
+that go super wrong with that, but it shouldn't be allowed and this will be handled bu the Authorization token in HTTP header.
+
+We don't focus on auth because it happens with pretty much every application.
+
+Also the **follow** API: A user can follow another user. The api receives the userId and username of the person that they're trying to follow.
+
+How are we gonna be storing this data?
+
+In particular we're gonna be storing 2 things:
+- tweets
+- follows
+
+We have a table for tweets(named `tweet` table) and a table for follows(named `follow` table) in our relational DB.
+In follow table, we have these 2 columns and some other
+- followee: the person that's being followed by the follower
+- follower: the person that's following the followee
+
+To get the feed of a user, we want to get all the tweets of people that this person follows. So he's the follower and he wants all the
+tweets of his followees. 
+
+How would we index the `follow` table?
+
+We'd probably want to index based on the **follower** becasue then all records in this table, will be grouped together based on the follower.
+So all the people that current client who wants his feed, follows, will be grouped together in the table, it will just be a range query.
+So we would favor indexing based on the follower column if we have a read-heavy system.
+
+About the `tweet` table:
+
+Schema:
+
+tweet_id  |  timestamp |  user_id(the person who created it) |  content
+
+Note: We don't store the media itself in the DB, we'll have a reference to that media(references the object storage).
+
+---
+
+The bigger problem with our storage is we're gonna be storing a massive amount of data. 50GB of data are gonna be written per day to our
+relational DB(if we don't include the media). So that's a lot of data. In a month, we would have 1.5TB. In a year, we'll have roughly 18TB.
+The problem is we're gonna be having **so many** reads hitting our relational DB. A person is gonna be reading 100 tweets per day and we have
+200M of users.
+
+Solution:
+
+The first approach and obvious thing to do is to have **read-only replicas** of this DB. If reads are te bottleneck, it's not hard to just
+add additional DB instances.
+
+If we do have read-only replicas, it's **OK** if a single instance gets the writes and then asynchronously populates the read-only replicas,
+because in the case that a user ends up hitting one of the replicas and gets some stale data, it's **OK** if it takes 5 seconds or 20s(not ideal
+but not end of the world with sth like twitter) after a tweet is created before a user actually gets that tweet.
+
+Now the problem will be when a user creates a tweet, if we have single leader replication, all those writes
+are going to be hitting a single DB and remember if we have 50M writes per day, **if we divide that by 100,000 which is roughly the amount of 
+seconds in a daty** we get 500 writes per second. Well probably even more than that but note that this number is the average, the peak could be
+much higher. The peak could be 10 times of this amount! So we should be able to scale our writes as well and the obvious way to do this is by
+using **sharding**. But the question is: How are we going to be implementing this sharding? What type of shard key are we going to be using?
+
+The most obvious and easy way would be to do it based on `user_id` because that's kinda the whole point of our design the way we scoped it out.
+A user only cares about a subset of users(his followings), he doesn't care about every user. So it doesn't make sense to do it based on
+the tweet_id, because what we want is to break up our relational DB into pieces and we want a particular user(client) to ideally **only** have to
+hit **one** of these pieces. With the logic of our system, especially the sharding logic, a user(client) should know which people
+they follow and then we can route their req to the appropriate shards that contain the tweets of the people that they follow. And we'll know
+that because we can use our shard key to determine that. But if we break up the tweets(`tweet` table) based on the tweet_id, we don't know
+which shard contains the tweets of the people that the client follows. So we'd have to query all the shards which defeats the purpose.
+So we choose to shard the DB based on user_id.
+
+How do we get the people that the user follows?
+
+If we shard the tweet table based on user_id, all the people that the current client follows, should be on a single shard.
+
+Since we don't have complex queries and joins to retrieve the tweets.
+
+---
+
+A potential problem is we will have to order the tweets. Just fetching the tweets is not enough, we will have to query them and then order them
+based on the time that they were created. How many tweets are we looking for? If we're just looking for a small number like 20, what if the
+user wants to scroll down in their feed and we want 20 more tweets? We don't necessarily need to get all tweets immediately, we need to
+wait for the user to scroll, or maybe we **can** get all the tweets immediately. Before getting into this, let's see how our current system
+is going to work?
+
+---
+
+When a user creates a tweet, it will go to the app servers, based on the user_id(client's user id) we will find the appropriate shard and then
+store the tweet on that shard and then any images and media on object storage. As users view their feed, we may have to query multiple
+shards to find all the relevant tweets and then order them and then send them back to the user. That could definitely be very slow,
+that's clearly the bottleneck here. Now we do have a caching layer and in theory, the most popular tweets will be stored already on this cache
+and if they're not, we can have some type of LRU algo working here, because we care about most **recent** tweets. Most likely people aren't
+gonna be viewing tweets from a year ago even if they had a like billion views, after a while people get tired of them, so LRU is better than LFU.
+
+In theory, caching should definitely help us lower the latency, but remember different people will have different tweets. We definitely can't
+guarantee that all 20 tweets that this client wants to see, are already going to be cached. What if 19 of them are already cached and then
+that last one tweet, we still have to go and read the disk(DB) to get that tweet.
+
+So the problem we're running into is not really scalability, it's latency. Caching helps with that, sharding also helps with that(that's kind of
+point of sharding), with read-only replicas we're able to handle scale, but as we break up the data into smaller chunks(shards), then we can
+also lower latency because we're gonna be querying a smaller amount of data, but we still may have to query **multiple** shards. To get this
+latency even lower, we can get creative and we can generate the news feed of users, asynchronously and we would do that for every single user in theory.
+Because we know a large amount of the users - 200M out of 500M - are active and it makes sense to generate the news feed for all of them, even if
+60% of them aren't actually gonna actually view it, it's not a ton of wasted work and we could also tune it such that we only pre-generate
+the news feed for people that are actually active within the last 30 days.
+
+At very high level what we can do is have some kind of message queue or pub/sub system which will take every new tweet that is created from 
+app servers. So when a new req for create tweet is arrived to app servers, it will not just being written to the DB but it will be sent
+from the app servers to the pub/sub queue and this queue will feed into a cluster(sth like a spark cluster), but the point is that these workers
+will in parallel, process all the messages that we're getting from the app servers, which will include everytime there's a new tweet that is created,
+there could be **a lot**, so we need to do this pre-generating of news feed asynchronously. Now the workers will feed into a new cache named
+`feed cache` and this cache will be responsible for storing the user feed. So now when a user loads their home page to get their list of 20 tweets,
+the app servers will be hitting the `feed cache`, maybe the `cache` is used for individual tweets that maybe are embedded on websites or sometimes
+you just open up an individual tweet not in the context of a user feed and you wanna maybe look at the replies of that tweet. So the
+`cache` is starting to make a little bit less sense even having it. So I'm just giving some possible use cases.
+
+So the `feed cache` is the cache that we'll actually have to have a feed for every single user. So if it's in-memory, it has a large
+amount of data. We have 200M users, if we want to have 100 tweets for every single user, it will be a large amount. So we probably want to
+shard the `feed cache`, similar to how we did with our relational DB. So `feed cache` will definitely lower the latency, because the feeds are
+not generated as a user actually requests to get the feed, we don't have to run a complex query on our relational DB, having to query multiple
+shards and then joining the results together based on the time that they were created and then ordering them like that. The feed will actually
+already be created. Now the complicated part is actually updating the tweet. We kina went through the flow of when a tweet is created,
+it will be added to the message queue and then for that individual tweet, the workers will add that tweet to all the feeds of people that are
+following the author of that tweet. But now the problem is if somebody has 100 followers, then these workers will have to update 100 feeds.
+But what about somebody like Kim kardashian who has maybe 100M followers? Updating a 100M feeds every single time somebody popular makes a tweet,
+is very very expensive. Maybe in that case, it's not the end of the world for us to have to update the feed of that user at the time that they
+actually requested. Because somebody could have 100M followers and us having to update a 100M feeds everytime the celebrity make a tweet, is
+pretty expensive but not all 100M of those followers are even loading their feed every single day, so it'd be probably easier to do that work
+(generating the feed) as it's needed. So when a user makes a req, they get their feed(mostly from `feed cache`) but maybe **in parallel to that**, our
+app servers could look for other tweets, probably a popular tweet by a celebrity is cached in `cache`, so then at that point our app
+servers would also **update** the feed of that user in `feed cache`.
+
+---
+
+Now what gets even more complicated is what happens when a user follows somebody new?
+
+Their feed(`feed cache`) has to be updated in this case as well. Now it's ok, we can tolerate a few seconds, maybe 5 or 10 seconds before their
+feed is actually updated, but it does have to get updated nontheless and we would have sort of a similar mechanism where a user
+follows somebody new, from app server we add a message to the message queue, we have a bunch of workers that then have to update the `feed cache`
+of the person who followed somebody else.
+
+Note: The cluster of workers have to read from relational DB which has the tweets themselves.
+
+Note: The whole point of having pub/sub + workers is to lower the latency when somebody opens up their homepage and they want to see 20 tweets,
+we want it to be as quick as possible and all this complexity arises from that. If we can tolerate few more seconds, we can simplify our
+design.
+
+There are problems with this design:
+- there could be concurrent updates to the feed cache
+- a lot more details that we didn't discuss like:
+    - how would the ordering of the feed even be(in the feed cache)?
+    - when the client loads 20 tweets and now they wanna see 20 more, we obviously have to paginate that
+
+![](./img/3-2.png)
+
 ## 4 - Design Discord
 ## 5 - Design Youtube
 ## 6 - Design Google Drive
