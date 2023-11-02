@@ -940,7 +940,214 @@ There are problems with this design:
 ![](./img/3-2.png)
 
 ## 4 - Design Discord
+Discord or any type of group chat application, like slack or microsoft teams.
+
+### Background
+We have certain types of groups, slack calls them workspaces and discord calls them servers.
+
+Each server has a bunch of channels. Each channel has a history of messages and OFC they're ordered based on time.
+
+Discord and many other chat apps have this functionality which is when we open a channel, we're not going to immediately
+to the bottom to see the most recent message, because there could be a bunch of messages that we haven't seen and we want to keep
+track of those messages that we haven't seen so that we can pick up where we left off.
+
+With chat messages, users can mention each other with @<username> and when we do that, next to the channel name there is a number in
+red background which shows n mentions that are unread. This red notification could also apply to direct(pv) messages which most chat apps
+support this kind of message which is called direct messaging or DMing. This number of notifications could apply to discord server or
+slack workspace or it could also apply to an individual channel in that particular server.
+
+### Functional requirements
+We want to focus on servers and the channels within those servers and then sending and receiving messages in those channels and being able to
+pick up where we left off. If we didn't have to implement picking up where we left off, it would be a bit simpler.
+
+With this design, we're gonna be going deeper into servers and channels functionality and not focusing on DMing people functionality.
+
+So we want users to be able to join servers and channels but we won't be focusing on that either because sometimes you need an invite to join
+the server, sometimes some channels have permissions like you don't have permission for a particular channel. Also with discord you can
+call people and video chat, we won't be focusing on that either.
+
+So we mainly care about the chat functionality within channels, we want to be able to pick up where we left off and we also want to be able to
+have a visual indicator for number of notifications for a particular channel and a particular server and sending and receiving messages in a channel
+and see them in real time.
+
+If there are no unread messages, we should start at the most recent message when we open the channel.
+
+As messages are coming in realtime, we should see those with as minimal latency as possible. Because that's the whole point of chatting.
+Note: In this case we don't have to worry about media, we just care about actual text, so with that, it should be feasible for us to
+get the messages with as low latency as possible which kinda brings us to the non-functional requirements.
+
+### non-functional requirements
+The latency is minimized and in terms of availability, OFC we want to have as high availability as possible, but we could have a 100% availability
+and if we have high latency, it doesn't really matter. So we favor lower latency over availability but at the same time we want to
+build our design so that it's redundant and fault tolerant and highly available.
+
+Let's say we're a startup:
+
+we're supporting 5M daily active users(DAU). We're in early days of discord.
+
+We have 50M messages sent per day. But do we really care about the total amount? We care about where we're gonna reach the bottleneck.
+
+Note: In non-functional requirements it's important to dig deep into what the limit could be.
+
+In the context of discord, how many people could be in a server maximum? 
+
+Let's say 20k is maximum of people in a discord server.
+
+Let's say 200K messages are sent per day in a server.
+
+Most users in a server aren't gonna be active most of the time. So let's say we're dealing with 20K messages per day in a server.
+In the worst case, all these messages could be in the same channel. That will put some strain on our resources.
+But let's say the messages in a **channel** per day is even less than 20k and it's 10k.
+
+Let's say max limit for a message is 2000 Bytes. So most likely 2000 characters. But there could be additional metadata with that.
+So 2KB per message.
+
+In discord, most(all?) of the messages are gonna be written, but most of them are not gonna be read very frequently. We're only gonna
+be reading the most recent messages. So you might wanna look at all the messages in the last day which could be sth like 10k but this
+is upper bound.
+
+### High level design
+sendMsg(body, server, channel) - the id is gonna be created server-side. Sending a message is straight forward, that could be sent
+in a typical HTTP req, but when it comes to receiving messages in real time, we want to as soon as someone sends a message, if we're in the
+same channel, we want to see that message. We can technically do it with HTTP, we can do polling, like every few seconds we can check is there
+a new message by sending a HTTP req and see if there are new msgs that we haven't seen, so we can get them. What would the interval of this be?
+Every 1 second? that would mean in the worst case, we have to wait 1s after a message is sent before seeing it. That's not too bad,
+it might be acceptable but the problem is that there probably isn't gonna be a new message every 1s. So in terms of resources, this is not
+efficient. With this approach, for every person that's in the channel and is online, we're gonna be getting a req every 1s, that's a lot of
+traffic. We could make this every 5s but the latency would be higher.
+
+A better approach to HTTP(at least http 1.1), would be **websockets**. Note that nowadays http supports the similar functionality of websockets,
+using http streaming.
+
+With websockets, we don't need to implement polling, the server can **push** new messages immediately as they are sent in a channel, to every
+user who is in that channel(active in that channel), if they have an active websocket connection with the server.
+This will help us reduce latency.
+
+Q: What about opening up a channel and seeing all the unread messages? Or just starting at the most recent message? How do we handle the page load?
+
+A: Client makes a req like viewChannel() and they get a response but not all the messages, we paginate this with a page token.
+The experience of viewing a channel is gonna be different for every single user, depending on what was the last message that he read? Or what was
+the timestamp of the last message that he read?
+
+Note: We would need a separate server for websocket and another server being HTTP based.
+
+### Design details
+We have many many approaches.
+
+We're gonna be focusing on if we did this with SQL. Because we're not gonna be dealing with a super massive scale and we have an obvious
+strategy for sharding our data. We can use `channelId`. But we'll also discuss how we can do things with a non-relational DB like mongodb
+which is what discord was originally using and they migrated to cassandra which gave them a lot of flexibility on how they wanted to partition
+their data.
+
+We need at least two tables:
+- messages
+- user_activity
+
+Messages table is the largest one(uid is userId).
+
+The sent_at is gonna be used for ordering our messages. So we want to index the messages based on sent_at col. **BUT** remember that messages
+are only viewed in a single channel, so it might be better to index based on channel_id.
+
+With massive size of this table is going to be, we need to shard it based on channel_id, so that every time a user makes a req to view the messages
+in a channel, they should be hitting a **single** DB shard, they don't have to look at multiple shards and it's not the end of the world
+if a second channel in the same server has messages on a **separate** shard, because then when the user wants to view that channel's messages,
+they can hit a different shard, it doesn't make a difference. We could shard based on server_id as well because that way it guarantees
+that all messages in a channel are on the same shard.
+
+With sharding based on channel_id, we can index the sent_at col because we already broke our data up into shards so we shouldn't have a massive
+amount of data on each shard and we know all the messages for the same channel_id are gonna be on the same shard so then we can afford
+to index based on sent_at, because remember we only care about the most recent messages. So ordering based on sent_at is gonna be important,
+it's gonna speed up the queries.
+
+Another way to speed up queries, is to add a caching layer in between the server and DB OFC. Some channels are gonna have a lot of reqs
+made to them and to speed those up, we can have that caching layer, but at the same time, this caching layer is going to be updated
+very frequently because as users send messages, the cache will get stale pretty quickly.
+
+We can discuss about what happens when a user sends a message, do we also wanna update our cache at the exact same time or ... .
+
+Querying the most recent messages should not take long because we're not dealing with a super high amount of users per each server and each channel.
+What's more important is how we implement the functionality of when a user has not seen the last 50+ messages, they want to pick up where they
+left off. That's why we have user_activity table. So for every single user, for every channel that they've already visited, what was the last
+time that they visited that channel. Because if we store this info in user_activity(which has last_read_at) for every user, then it's possible
+for us to make a query on the messages table to show them all the unread messages.
+
+An example of query for that:
+```sql
+select * from messages
+where channel_id = 'example'
+and sent_at > (
+        select last_read_at
+        from user_activity
+        where uid = 'neetcode'
+    )
+```
+Note that we need pagination, so we would have limit statement in the query and also note that everytime user scrolls we rerun the query, so we have
+to update the last_read_at, so that we don't return the same messages every time. So we can update last_read_at using the sent_at time of the
+last message that the user read.
+
+We said we index based on sent_at time, but discord actually does sth clever where the actual id of the message is already chronologically sorted.
+They also don't use a relational DB.
+
+Q: What about counting the number of times a user was mentioned for a single server, or a single channel?
+
+A: We can have a similar query like:
+```sql
+select count(messages.id) from messages
+where channel_id = 'example' -- or based on server_id
+  and mention_id = '<neetcode user id>'
+and sent_at > (
+        select last_read_at
+        from user_activity
+        where uid = 'neetcode'
+    )
+```
+The problem is the way this is setup, that would be just as slow as opening up a single channel and we have to possibly run this query multiple
+times. Because as you open up a discord server, there might be 10 channels and you wanna know how many times you were mentioned in each channel?
+So opening up discord and getting that notification info is gonna be slower than opening up an individual channel and seeing the messages in that
+channel!
+
+Maybe it's acceptable because while the server loads, just seeing the notification count can take a few extra seconds, but what we can do to speed
+this up?
+
+This is a good use case for a cache, specifically an in-memory cache because we want it to be faster than reading from disk. But what would we
+do to store those notification counts on the cache? Because we want the reading the notification count to be quick.
+
+Maybe every time a message is sent, first it's gonna be sent to the server OFC and if it mentions somebody, it could contain a mention_id or it
+could not, but if it does, our app server is gonna have some logic that for that user which was mentioned, we're gonna update a record
+in our cache which is gonna be some key-value store where the key could be some combination of the user_id(uid), server_id and channel_id.
+
+Now how are we gonna actually calculate that notification count?
+
+If we just got a new message that mentioned somebody, our server can read from the DB and using the last_read_at of the user that was mentioned(mention_id
+points at), we can also count the number of messages that they were mentioned in that they have not read in that channel and calculate that and
+store that in our cache(not the cache between server and cache, another cache), so that the next time that that user who was mentioned(not the one
+sent the message, but the one who got mentioned) loads his server, they'll get all those mention counts very fast from the cache.
+
+Now if the user who got mentioned was already on the server as they were mentioned, we would have some type of websocket that would push
+that notification to user.
+
+How discord actually handled storage?
+
+They didn't use a relational DB ever. Originally they were using mongodb, they indexed their collections in mongo based on channel_id and sent_at,
+because messages should be grouped by channel and ordered by sent_at. The problem they ran into is as the number of messages grew,
+that index could not fit into memory. In general, indexes fit into memory if they're small enough, which makes the query much faster, but if
+the index is stored on disk, then the query is gonna run much slower and this problem arises when the number of records gets very large.
+So why doesn't discord shard their messages based on channel_id, but sharding is not very simple and in 2017, they though it was not worth the
+effort and it may not have yielded the best results that mongodb isn't very stable when it comes to manual sharding.
+
+So they went with cassandra which at high level supports two types of keys:
+- partition key: cassandra is distributed, partition key tells you where that data is stored(on which partition). Discord used channel_id as
+partition key for messages. So all messages for a channel should be on the same partition if possible. Now for every partition, how is the data
+grouped together? For this, there is cluster key.
+- cluster key: You might think discord used sent_at as cluster key. No! Since in some cases, messages can have the same sent_at time, they used
+a combination of channel_id and message_id(id), it's because they were able to chronologically sort the message ids, so they were able to order
+the messages in the order that were created(the time is stored in the id itself).
+
+![](./img/4-1.png)
+
 ## 5 - Design Youtube
+
+
 ## 6 - Design Google Drive
 ## 7 - Design Google Maps
 ## 8 - Design a Key-Value Store
