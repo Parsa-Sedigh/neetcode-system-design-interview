@@ -1146,7 +1146,246 @@ the messages in the order that were created(the time is stored in the id itself)
 ![](./img/4-1.png)
 
 ## 5 - Design Youtube
+### Background
+Compared to netflix, YT is a bit different, in YT users can actually upload videos and it's free. Pretty much anyone can upload videos.
+We can watch videos.
 
+So upload and watch is core functionality. But there are other ones like search for videos, recommendation, commenting, liking and disliking
+videos, analytics that goes on with reporting views and ..., bot prevention with comments and ..., advertising .
+So:
+- upload
+- watch
+- recommendation
+- comment, like, dislike
+- bot prevention
+- analytics
+- advertisement
+
+### Functional requirements
+Main features(functional requirements) that we want to focus on are gonna be:
+- uploading vids from a user's perspective
+- watching vids from a user's perspective
+
+### Non-Functional requirements
+Reliability when it comes to videos. You would never wanna run into an issue where somebody uploads a video and then that video is somehow
+corrupted or deleted. We definitely don't expect that when we're storing sth on YT, even though it's free we would'nt want a video to just
+disappear, so we really need the vids to be extremely reliable at least in terms of storage.
+
+About the scale that we're gonna be handling:
+
+Even a single video can have potentially thousands of concurrent viewers.
+
+We wanna handle 1B daily active users(about accurate to real world YT).
+
+Let's say each user is watching 5 videos per day.
+
+About the watch to upload ratio:
+
+100 users are watching videos / 1 user uploading video
+
+So 100 / 1 is the ratio of reads vs writes for videos.
+
+We have 5B of videos being watched per day. The ratio of read/write was 100/1 so 50M videos are uploaded per day. So a massive amount
+of throughput. The good thing is among these 50M videos, most of them probably aren't gonna be getting a ton of views. We can guess that the
+top 5% of the videos are gonna get 90% of the views.
+
+We definitely want to favor availability over consistency. What do I mean?
+
+Everytime you go on YT and refresh the YT home page and you wanna see a bunch of vids on your homepage, everytime you make that req, you should
+get a 200 res and things should work, and it's ok if we have to sacrifice consistency to achieve that. What do I mean? What if you're in your
+subscription feed and somebody you've subscribed to, just uploaded a new vid 1s ago and you just refresh your home page, but you don't see
+that newly uploaded vid. Hypothetically this could happen if we have multiple storage systems and one of the storage systems that you happen to
+be reading from when you refresh the subscription feed, didn't have the most up-to-date data, but another one had, but eventually that new vid
+will be replicated to other storage, but it takes a few seconds. So you're getting the stale data, we're favoring availability over consistency.
+So the worst thing that would happen is most likely you'd have to wait a little bit longer, maybe a new vid is uploaded, you have to
+wait 5s or in worst case 10s, before you can see it, it would be lot worse if you refresh the page and it didn't return anything to you at all.
+
+We also want to minimize the latency. When you click to watch a video, ideally it should start playing immediately, even if the entire video
+isn't loaded and if we have a good internet connection, we shouldn't have to experience any buffering or waiting for the vid to load.
+
+### High-level design
+Uploading is gonna be more complicated than watching a vid and also uplaoding is gonna give us a better sense of infra that's gonna be involved
+with our design.
+
+User journey of uploading a vid:
+
+Since we're dealing with such a massive scale which is 50M uploads / day . We can't handle that with a single server, so we would have a 
+load balancer sitting in between a bunch of application servers, so that we can scale this horizontally.
+For now, it doesn't matter user hits app server #1 or #2 or ... .
+
+Even the act of uploading a vid is not simple. What happens when there's a short internet connection breakage, like for a second? and we're
+uploading a file that's over 1GB, we were already half-way through, but now would we have to restart over or could we start where we left off?
+Let's assume this is not the direction that we want to go in.
+
+Once the vid is uploaded, it's gonna be stored in some object storage and let's say this is where we're gonna store the raw files that the user
+uploads.
+
+The reason we're using an object storage is that's a lot better for storing media and large files like videos, we don't want to store
+them in a relational DB. Examples of object storage are aws s3 or google cloud storage which they handle replication for us. So we can safely assume
+that if we store sth in an object store, we don't have to worry about it being deleted.
+
+So at high level we can assume we have our reliability covered.
+
+Note: Google drive is built on top of object storage.
+
+Storing videos at object store is fine but what about the metadata associated with every video?
+
+What the api for uploading would look like?
+
+`upload(title, description, video, uid)`, video can be sth like mp4 file which is what's gonna be stored in object storage. There could be a bunch of
+other things that we store, things like tags and ... , so we can accept tags in the api as well.
+
+We want to associate every single vid with a user, so we need uid. Because on yt underneath of vid, there's a profile picture of the person
+who uploaded it, this isn't like netflix where there are just shows. On YT **people** are actually creating the videos(content creators).
+
+So everytime we wanna show a vid to a user, we're gonna have to join that video with the user info and video metadata of that video.
+
+So everytime we upload a vid, we're also gonna be storing metadata associated with that video in the NoSQL DB and we're also gonna be storing
+user info in nosql DB. We chose a nosql db because we're gonna have so many videos uploaded, probably gonna be needing to read this
+metadata db very frequently. In this DB itself, we can store a reference to the video file in the object store.
+
+For nosql db, we can use mongodb which stores things in json format and in collections. A document has all the info about a single vid.
+We can have another collection for users.
+
+Q: If a user wants to watch a vid, don't we have to then perform a join with users collection?
+
+A: Not necessarily, because with nosql DBs we can have our data de-normalized.
+
+Normalized means you don't store duplicate data, you have separate tables and then when you want to aggregate or combine info, you can join
+those tables. But in mongodb you don't have to do this. We can store duplicate info. So in every vid metadata, we would store the relevant user
+information, so that we don't need to join the videos collection with users collection. Again why we do store user info in video document?
+Because when a user wants to watch a video, they see the profile picture of the uploader. Now that profile picture is also gonna be stored in
+object storage, so we'll have a reference to that profile picture in the user document, but we'll also(data de-normalization or duplication)
+have it stored in every video document which the creator was the one the user wants to watch one of their vids.
+So we'll have duplicate references to that profile picture, but that's ok in nosql, because it
+improve our performance, we don't have to perform joins. Now what happens if a user updates his profile picture?
+Yes, we'd have to update the related doc in users collection and also update every single video doc where that person uploaded that video.
+Maybe they have a 100 vids or 1000s, we'd have to update all of those documents and in this case that's ok, because first of all
+they're probably not gonna be updating their profile pic very frequently, uploading and watching vids are more frequent. So that's what we're
+favoring here, reads over writes. But also if they update their profile pic, we can update all of those vid documents asynchronously. We don't
+have to do it immediately. Is it gonna be end of the world if somebody sees an old profile pic from this user for a few minutes or maybe
+even an hour? Probably not.
+
+When it comes to videos, encoding is a big part of it. As users upload videos like raw video files to YT, YT does a lot of video encoding
+and compression to get the size of those vids down and encoding a video is not sth that can happen like in 1s, this is definitely an asynchronous
+task, so it can take on the order of minutes to encode files(typically) and if there are really large files(YT allows you to
+even upload a 24hr video file), it can probably take hours to do the encoding. Which is the reason why we're using a message queue for that.
+
+So as raw video files are uploaded, we're gonna be storing them but we're also gonna be adding them to a queue, so that they can be sent to
+another service which is gonna be handling the encoding(encoding service) and it's not gonna be a single server, we're probably gonna have a ton of
+servers to do that.
+
+After videos are encoded, they are going to be stored in object storage, because they're still videos! We wanna store them in object storage(encoded)
+to make sure that they are reliably stored and replicated. Note that vids are immutable so we don't really need like hadoop file system or ... ,
+object storage is probably good enough, we're not gonna be updating a video, we'll be updating the metadata associated with it, but we're not
+gonna be editing a video.
+
+![](img/5-1.png)
+
+This was how a video is uploaded, now what about watching a video?
+
+We want the reads to be as fast as possible, we want the latency to be as low as possible. So anywhere we can add caching, is gonna be helpful.
+
+Note: Users are not gonna be reading from raw object storage, they're gonna be reading encoded video files(encoded object storage) and
+we want the encoded object storage to be disturbed around the world. Also to have the videos stored as close as possible to end users,
+we can have a CDN service which distributes static files geographically close to users.
+
+So when a user wants to watch a video, the video file itself is gonna be loaded via the CDN which is gonna be pulling from the object
+storage that stores encoded video files. The user can fetch the metadata associated with a video from a DB(mongodb metadata), but to speed that up,
+because we know a small amount of videos are gonna be getting the most amount of views, we can add a cache in front of our NoSQL DB which
+the app servers can hit and that cache is OFC gonna be an in-memory cache, that's the whole point of speeding up, because disk is
+slower than memory. Note that the cache can not store every video, so we'll have to have some way to kick the videos off the cache.
+Most likely newer videos are gonna be getting more views, so we can have **LRU** cache here(the cache for nosql DB).
+
+### Design details
+Q: We have 50M videos uploaded / day. Now how many workers are needed for running encoding service?
+
+A: Note that encoding service is an easy service to scale horizontally(the encoding itself is a complex topic),
+assuming at a high level, one worker can encode one vid at a time. So if one person uploads multiple videos or multiple people
+are uploading vids at the same time, the vids are gonna be added to the queue and eventually they will reach the encoding service and after
+being encoded, they're gonna be stored in object storage. 
+
+The point is: Multiple videos can be encoded at the same time. There's no dependency or ... .
+
+So we have 50M uploads / day and assuming that every vid takes 1 minute to encode, which is probably too small, it would probably take longer
+than that on average but let's say these workers have good resources and maybe most vids that we upload are pretty short.
+
+In terms of capacity planning: How many workers would we need?
+
+50 million uploads / day, assuming there is 100,000 seconds per day => 50 million / 100,000 = 500 videos per second are going to be uploaded.
+Now the first thing on your mind would be: Well, can't we just have 500 workers? No that's pretty naive because we said it takes 1 minute to encode
+every video on average, so if we only had 500 workers and in the first second we have 500 vids uploaded, each of those workers is encoding a single vid.
+Now one more second goes by and we have 500 more vids uploaded, but every worker is busy, so we add those 500 to the queue and then another
+queue goes by and we have 500 more vids to encode. The skips gonna happen until 1 minute has passed and then finally these 500 are done and we can
+store them in object storage and now the workers can get 500 more vids to encode, but by this point our queue would be back loaded pretty hard.
+At this rate, we would never get through the backlog, so we need more than 500 workers. 500 * 60seconds = 30K workers and this is the answer roughly,
+but with the encoding it's pretty hard to get an accurate estimate.
+
+So we definitely need more than 500 workers. We need more workers than the number of vids that are gonna be uploaded in a second, that's for sure.
+
+Neetcode is not sure that with one worker we can handle multiple vids at once.
+
+Another interesting thing about this problem is about watching a video:
+
+When we watch a YT vid, we don't need to wait for the entire video to download before we watch it. When we move forward or skip some parts,
+it would download the seconds or minutes a head. We're making HTTP reqs to load chunks of video. This is a technique to lower the latency.
+The response Content-Type would be audio/webm and video/webm(we're sending 2 reqs each time to get both audio and video). So audio
+is fetched separately from video.
+
+While rendering and loading vids is also a domain knowledge heavy topic, it's worth mentioning the technique we talked, is small chunks of vids.
+This is called **video streaming**, not necessarily live streaming, because we know that vid is already stored, it's not like live feed, the video
+is being streamed meaning it's being send in small chunks vs when you actually download a vid, that's not streaming that's taking the entire
+file that's stored and then sending it to your computer and then storing it, whereas in video streaming those small chunks are stored in your
+computer's memory, which is why you would not the entire vid to be taking up all of your memory, so most likely there's some client side code
+that is handling that and freeing memory. So frontend devs should keep this in mind. For example if we're watching a 10hr long vid,
+you would not need the entire vid to be buffered in our memory.
+We don't need to send the entire vid to the user before they can start watching it, we can send them small chunks of the portion that they're
+actually watching.
+
+Q: What protocol should we use for sending vids?
+
+A: Since we want latency to be as low as possible, you might favor UDP over TCP for video streaming. But that's a better choice for 
+video live streaming because if you miss one second of a live vid, you don't want to go back to that one second, you want to keep up
+with the most up-to-date info. That's what UDP favors. But with the video streaming, we know vid is stored somewhere(encoded object storage)
+and we want to watch the entire video. If you're watching a movie or sth, you don't want to miss 2 seconds of it, because that might be an important
+moment. So TCP is favored for reliability, that will ensure that there's not gonna be missing gaps in the received chunks and sure it might
+take longer to do that, but as long as we send it in small chunks, it should be OK and that's exactly what YT does: it sends http reqs
+which are built on top of tcp.
+
+About uploading vids:
+
+We want to rate limit this API. We don't want somebody to just be able to infinite number of vids. This can be implemented in the load balancer(before
+hitting app servers, req goes to load balancer).
+
+About recommendation and searching of vids:
+
+We want to have auxiliary services which read from nosql metadata DB and we probably want to store a history of what types of vids does this person
+watch? what types of vids do they like? So we can build some recommendation for them.
+
+About searching vids: It's like designing google search because there's a lot of indexing you can do.
+
+We want to incorporate recommendation with searching.
+
+We can have show some autocomplete when user is typing string in the search input, by storing which vids are most relevant when searching a string.
+
+What YT actually did?
+
+A: What YT actually did, was not use a nosql DB, they actually used mysql which is RDBMS. Why didn't they use nosql for metadata?
+One guess is because YT was built in early 2000s and mongodb did not exist and they probably didn't have to handle the same scale that they do right now,
+but at times went on, the first thing they did was adding read-only replicas because it's a read-heavy system. But even then they ran into issues and
+next they tried to add sharding and they ended up having a lot of complex code in their app servers to properly routing user reqs to correct shard
+and then the longtime solution they found was by building a new engine `vitess` to decouple the application layer(app server code) from the DB layer,
+so that the application layer should not have to know about how the DB is sharded. So vitess was added as a middle layer in between app servers
+and metadata nosql db and that is where all the logic for sharding and routing the user's req to the correct shard lives.
+
+So this is a way to make relational DB to work with sharding.
+
+Planet scale is taking mysql and adding vitess to it and some more features and selling!
+
+Note: If we're doing a lot of reads and eventual consistency is fine(so consistency in the exact moment is not important, which is sth
+that ACID guarantees), we can use a nosql DB. But YT made mysql to work with heavy read scale and work in this case.
+
+![](img/5-2.png)
 
 ## 6 - Design Google Drive
 ## 7 - Design Google Maps
