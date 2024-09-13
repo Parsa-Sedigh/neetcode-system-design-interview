@@ -670,6 +670,104 @@ This was one way of designing tinyurl.
 ## 6 - Design Google Drive
 ## 7 - Design Google Maps
 ## 8 - Design a Key-Value Store
+Key value store is one type of NOSQL DB.
+
+### Background
+Zookeeper and redis are considered a kv stores.
+
+But we wanna focus on doc dbs and kv stores(like dynamodb) and wide-column store(cassandra).
+
+Note: wide column stores are considered a type of key-value store
+
+### Functional requirements
+Ops we wanna support:
+- get(key)
+- put(key, value)
+- delete(key)
+
+### Non-Functional requirements
+- durable
+- do not need to fully support ACID
+- scalable(so we will need replication and sharding aka horizontal partitioning)
+
+Note: In sql DBs, isolation means if two transactions are happening at the same time, they will appear as if they happened in a
+particular order so we won't get conflicts with sql dbs, we can lock a row or ... . When a trn is running on a row,
+that row is gonna get locked and then once the trn is completed, then it's gonna get unlocked and then the next trn
+can run on that same row, so we won't get conflicts. But with nosql dbs we have conflicts.
+
+### High level design
+1. indexing data
+2. replication
+3. partitioning
+4. node failure: If a machine goes down, we have to have a strategy for recovering and how our system is gonna behave if this happens.
+5. concurrent writes: we mentioned that we don't have isolation with writes, therefore we're gonna end up with conflicts. So we have to
+have a way to resolve those conflicts and have our system be able to handle concurrent writes.
+
+We know SQL DBs use B trees or B+ trees and even some no sql dbs use these as well.
+
+Nosql dbs like cassandra and big table use LSM trees to optimize for quick writes but not necessarily quick reads.
+
+Q: Why we need replication?
+
+A: Because we can't just hit a single node because of having high traffic. When we consider replication, we should also think about
+CAP theorem and ... .
+
+Q: Why we need partitioning?
+
+A: Yeah, we handled the high load through replication, but we also need to handle large amount of data. We can't just
+store all of the data on a single machine, we need to split the data on multiple nodes. This is horizontal portioning.
+There's also the vertical portioning which is less powerful which is keeping all the data on a single machine and instead of
+splitting the rows(as we do in horizontal partitioning), we split the **columns** into multiple tables or whatever they call it
+in that nosql db. That makes queries faster and it's a bit easier than horizontal partitioning, but it's less powerful.
+
+The vertical scaling always has a limit but horizontal scaling can be done infinitely.
+
+### Design details
+#### How do we store and index the data?
+We use LSM tree(log-structured merge tree). Allows us to have quick writes. The biggest reason of having quick writes is 
+writes are batched in memory with LSM trees. So the writes are not immediately written to disk, instead they go to memory
+into a sth called **memtable** and periodically as those writes are written to memory, eventually they're gonna get flushed to
+disk in what's called an **SSTable**.
+
+SStable(sorted strings table): In the kv store, when we store the data in sstable which is in disk, ideally we should be able to sort it based on
+the key because when we wanna read data, we wanna find it fast because we can do sth like a binary search. 
+The sstable is sorted based on the keys.
+
+With cassandra, the recommended SSTable size is to keep it 100sMB like 200MB and we can create more ss-tables and by keeping
+them small, when we wanna find a key, we can see that the range of vals in a ss-table can't have that key(since it's sorted),
+so we can search it in another sstable. So reads can be a problem because in worst case, we have to search through all sstables.
+
+Another problem is if we initially write to memory and batch and flush that to disk, what happens if the system crashes? Then
+all the writes in memory that weren't flushed, will be lost. This problem is solved by taking every write and **also** writing it to
+a **transaction log**.
+
+Another problem is: we wanted to optimize the writes and we did. But what happens when we wanna update(another kind of write)?
+We have to first find(read) it, so it will be slow. To get around this in a LSM tree, we just create a new key-value for that update.
+So we don't overwrite the existing data, the old val is still stored in some ss-table somewhere. So for updates,
+just like writes, first we write to memory and then at some point, it will be flushed to disk, maybe to a new ss-table and therefore the
+old val remains in prev ss-tables.
+
+The same goes for deletes. If we wanna delete a key, we will **create** a new key-value for it and mark it for deletion.
+This new record is called tombstone record(deleting sth this way without really deleting it).
+So we still have the value that we wanna delete, somewhere in a ss-table.
+
+**Note: SStables are immutable, no data can be overwritten or deleted.**
+
+But making old vals remain in disk, will take up disk space.
+
+Note: There is cleanup done in background where sstables are merged and compacted where if we have duplicate vals, they will
+be removed. The deleted records are also removed.
+
+#### replication
+Replication provides us to scale and also more fault-tolerance. 
+
+Note: if we could replicate across multiple countries and regions and zones, that would be even better in terms of fault-tolerance.
+
+When there is replication, we would have issues like consistency where one replica doesn't have the most up-to-date data that was
+written to another replica.
+
+To better understand this problem, we have CAP which tells us 
+
 ## 9 - Design a Distributed Message Queue
 How they can be implemented? How can we scale them?
 
